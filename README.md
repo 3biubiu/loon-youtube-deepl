@@ -1,6 +1,6 @@
-# YouTube DeepL 字幕翻译（Loon）
+# YouTube DeepL / Gemini 字幕翻译（Loon）
 
-在 Loon 中拦截 YouTube 原语言字幕，调用 DeepL 翻译并显示双语或纯译文。默认使用 **DeepL API Free**，支持自定义 API 完整地址。
+在 Loon 中拦截 YouTube 原语言字幕，调用 DeepL、DeepLX 或 Gemini 翻译，显示双语或纯译文。默认保持 **DeepL API Free**；切换为 Gemini 后使用独立密钥、大批量翻译和本地配额保护。
 
 仓库：[3biubiu/loon-youtube-deepl](https://github.com/3biubiu/loon-youtube-deepl)
 
@@ -20,7 +20,7 @@ https://raw.githubusercontent.com/3biubiu/loon-youtube-deepl/main/YouTube-DeepL.
 
 1. 使用 Loon **3.5.1（983）或更新版本**。本插件采用该版本起支持的 Script 配置语法。
 2. 在 Loon 的插件页面添加上面的订阅地址；插件已经配置本仓库脚本的完整 Raw 地址，无需单独导入 `.js`。不要使用 GitHub 的 `blob` 网页地址。
-3. 在插件参数中按下表配置 DeepL API Free。
+3. 在插件参数中选择 `DeepL` 或 `Gemini`，按下方对应表格填写参数。
 4. 按 Loon 自身的引导完成 MitM 证书的安装与信任，并启用 MitM 和插件。
 5. 打开 YouTube 视频，启用视频的**原语言字幕**，例如 English 或 English (auto-generated)。关闭 YouTube 自带的“自动翻译”，必要时重载视频使其重新获取字幕。
 
@@ -36,7 +36,52 @@ https://raw.githubusercontent.com/3biubiu/loon-youtube-deepl/main/YouTube-DeepL.
 
 DeepL 免费网页版账号和 DeepL API Free 是不同的产品；需要 API Free 的密钥。**只在 Loon 的插件参数中填写密钥，不要把密钥提交到 GitHub。**
 
-## 自定义接口
+## Gemini 配置（v1.1）
+
+下面的默认限额来自项目使用者在 **2026-11-04** 提供的 AI Studio 数据：`Gemini 3.5 Flash Lite`，**15 RPM、250K TPM、500 RPD**。它们不是对所有 Google 账号、项目或模型的通用配额承诺；请以自己项目的 AI Studio 页面为准。
+
+| 参数 | 默认值 / 用途 |
+| --- | --- |
+| 接口类型 | 选择 `Gemini` |
+| Gemini API 根路径 | `https://generativelanguage.googleapis.com/v1beta` |
+| Gemini 模型 ID | `gemini-3.5-flash-lite`，可修改；已核对官方模型文档 |
+| Gemini API Key | 填 Google AI Studio 的密钥；与 DeepL 的 API Key 分开 |
+| Gemini 每批字幕字符数 | `24000`；单批同时最多 800 条去重后的字幕 |
+| Gemini 本机每日请求上限 | `500`，可调低留出其他用途的额度；`0` 为暂停新的 Gemini 调用 |
+| Gemini 每分钟请求上限 | `15` |
+| Gemini 每分钟 token 上限 | `250000`；使用保守估算，不额外调用 `countTokens` |
+| Gemini 配额组 | `default`；同一 Google 项目的多把密钥应保持相同组名 |
+| Gemini 最长等待秒数 | `100`，含限流等待和翻译；到时返回已完成的部分 |
+
+**模型 ID 核实说明：**2026-11-04 已核对 [Google 官方模型文档](https://aistudio.google.com/docs/models/gemini-3.5-flash-lite)，模型 ID 为 `gemini-3.5-flash-lite`。尚未使用真实 Gemini 密钥进行连通测试。如果日志提示 HTTP 404，请核对账号的模型权限、API 根路径和实际可用的模型 ID；脚本不会自动切换到其他模型。
+
+AI Studio 的 `usage` 链接是网页，不是 API 地址，不能填入 API 根路径。脚本实际调用：
+
+```text
+POST https://generativelanguage.googleapis.com/v1beta/models/<模型ID>:generateContent
+```
+
+密钥通过 `x-goog-api-key` 请求头发送，不放在 URL 查询参数里；不会把 DeepL 的密钥当作 Gemini 密钥使用。
+
+### 如何减少每日调用次数
+
+- 将一批字幕作为一个请求，要求返回带 ID 的 JSON 译文。600 条较短字幕可以合为一次请求；更长的字幕按字符数或 800 条边界分成几个大批次，而不是逐条请求。
+- 先去重、读取本地缓存，再对缺少译文的条目分批。已有缓存不消耗本地请求额度。
+- Gemini 始终串行；默认总字符处理上限仍是 `max_chars=60000`。每次最多处理到该上限，超出部分保留原文。
+- 请求失败、输出截断、缺失或重复 ID 时不自动重试，也不拆成大量小请求“修复”；相应批次保留原文，避免额外消耗次数。输出截断后，可自行降低下一次的每批字符数。
+- 输出 ID 经校验后才对应回原字幕事件。即使模型返回顺序不同，也不会靠换行猜测对应关系；不完整或重复 ID 的整个批次不会应用。
+
+### 本地配额的边界
+
+- 发送 POST 前，先持久化计数，因此超时或网络失败也会保守地占用一次本地名额，不在结果不明时退回计数。
+- 每日计数按美国太平洋时间换日，并处理夏令时。分钟限额使用跨脚本运行的 60 秒滑动窗口。
+- TPM 预算按序列化请求的 UTF-8 字节数加最大输出 token 数 `32768` 作保守估算；它不是 Google 返回的精确 token 使用量，可能比实际消耗高，从而提早等待。
+- 服务端返回 429 后立即停止当前运行新增请求，保存冷却时间；明确识别出日配额错误时，保存当天暂停状态。不会同次自动重试。
+- Google 项目在其他设备、其他应用的调用无法从此插件统计；多个 Loon 脚本同时启动时，本地读写也不是跨进程的原子配额服务。**这里是尽力保护，不能保证不会收到服务端 429。**
+- 更换同一项目的密钥不会重置本地配额；更换模型或确实使用不同项目时才使用对应的模型和配额组。不要通过改组名绕过项目真实限额。
+- 本地计数读写损坏或失败时停止发出新的 Gemini 请求。翻译缓存和配额记录互相独立，关闭翻译缓存不会关闭配额保护。
+
+## DeepL / DeepLX 自定义接口
 
 `api_url` 会原样使用，包含路径和查询参数；脚本不会自动拼接 `/v2/translate` 或 `/translate`。
 
@@ -50,10 +95,10 @@ DeepL 免费网页版账号和 DeepL API Free 是不同的产品；需要 API Fr
 - 不生成原视频不存在的字幕，不处理 protobuf、画面内嵌字幕，也不保证所有 YouTube 客户端版本都使用可拦截的字幕请求。优先在 Safari 的 YouTube 网页测试。
 - 收到带 `tlang` 的 YouTube 自动翻译请求时保留原文，避免把它的译文再次翻译。
 - 先按字幕条目去重；DeepL 请求每批最多 50 条，并附带相邻字幕作为上下文。仍然按原字幕条目对应译文，不重新识别语音或重做字幕断句。
-- 默认每次最多翻译 60000 个去重后的字幕字符、等待最多 45 秒。达到限制或发生接口错误时，已完成的译文仍会返回，其余字幕保留原文。不会自动重试失败的 POST 请求。
+- 默认每次最多翻译 60000 个去重后的字幕字符。DeepL / DeepLX 默认最长等待 45 秒，Gemini 默认 100 秒。达到限制或发生接口错误时，已完成的译文仍会返回，其余字幕保留原文。不会自动重试失败的 POST 请求。
 - YouTube 可能一次返回整段字幕，因此加载视频时可能消耗整段字幕的 API 字符额度。这里的 `max_chars` 是处理上限，不等同于 DeepL 的计费字符统计。
 - 开启本地缓存后，在接口、语言、密钥和视频等配置相同的情况下复用译文。缓存会受容量和七天未使用时限限制；修改“缓存版本”可绕过已有缓存。
-- 字幕及部分相邻字幕会发送到你配置的翻译接口。脚本日志不输出 API Key、带签名的 YouTube 地址或字幕正文。
+- 字幕及上下文会发送到你配置的翻译接口。脚本日志不输出 API Key、带签名的 YouTube 地址或字幕正文。
 
 ## 检查问题
 
@@ -61,6 +106,9 @@ DeepL 免费网页版账号和 DeepL API Free 是不同的产品；需要 API Fr
 - **提示选择原语言字幕**：关闭 YouTube 的自动翻译，选择源语言字幕并重新加载。
 - **HTTP 403 / 456**：查看 DeepL 账号的密钥、产品类型与额度；不要把 API Pro 密钥配到 API Free 地址。
 - **HTTP 429 或超时**：降低并发、检查接口网络；旧 DeepLX 可选并发 1，长字幕优先用批量接口。
+- **Gemini HTTP 404**：核对模型的实际 API ID、模型权限和 API 根路径；不要将模型的网页显示名称直接当成 ID。
+- **Gemini HTTP 429**：确认 AI Studio 中该项目的剩余 RPD、RPM、TPM；不要因其他工具占用配额而提高本地上限。等待服务端冷却或日额度重置。
+- **Gemini 原文回退且无新请求**：检查日志，可能是本地配额保护、分钟等待超过本次时限，或配额记录读写失败。
 - **部分字幕没有译文**：检查日志里的字符上限、接口错误或等待时限记录。
 
 ## 本地验证
@@ -71,7 +119,7 @@ DeepL 免费网页版账号和 DeepL API Free 是不同的产品；需要 API Fr
 npm test
 ```
 
-目前包含 43 项模拟测试，覆盖字幕解析与转义、时间轴、接口协议、批量限制、缓存、鉴权失败、限流、并发、超时及原文回退。**尚未在真实 iPhone/Loon 和真实 DeepL 密钥下端到端验证。**
+目前包含 87 项模拟测试，覆盖字幕解析与转义、时间轴、接口协议、大批量和 ID 校验、缓存、鉴权失败、限流、并发、超时、配额持久化、太平洋换日及夏令时边界。**尚未在真实 iPhone/Loon 和真实 DeepL / Gemini 密钥下端到端验证。**
 
 ## 参考
 
@@ -79,3 +127,7 @@ npm test
 - Loon Script：`https://nsloon.app/docs/Script/script_v2/`
 - Loon Script API：`https://nsloon.app/en/docs/Script/script_api/`
 - DeepL API：`https://developers.deepl.com/api-reference/translate`
+- Gemini 模型：`https://ai.google.dev/gemini-api/docs/models`
+- Gemini 限额：`https://ai.google.dev/gemini-api/docs/rate-limits`
+- Gemini REST：`https://ai.google.dev/api/generate-content`
+- Gemini 结构化输出：`https://ai.google.dev/gemini-api/docs/structured-output`

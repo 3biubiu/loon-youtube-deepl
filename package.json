@@ -1,8 +1,8 @@
 {
   "name": "loon-youtube-deepl",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Loon plugin translating YouTube captions using DeepL API Free or a custom endpoint",
+  "description": "Loon YouTube subtitles with DeepL or large-batch Gemini translation and local quota guards",
   "scripts": {
     "test": "node --test tests/youtube-deepl.test.cjs"
   },

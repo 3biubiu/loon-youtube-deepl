@@ -1,16 +1,25 @@
-#!name = YouTube DeepL 字幕翻译
-#!desc = 将原语言字幕送至自定义 DeepL 或 DeepLX 接口；默认 DeepL API Free 和双语。填写 API Key 并启用 MitM。支持 json3 / srv3 / srv1 / WebVTT；失败保留原文。
+#!name = YouTube DeepL / Gemini 字幕翻译
+#!desc = 支持 DeepL API Free、DeepLX 和 Gemini 大批字幕翻译。Gemini 默认按 15 RPM / 250K TPM / 500 RPD 限流；填写对应密钥并启用 MitM。默认保持 DeepL 和双语。
 #!author = Custom
 #!homepage = https://github.com/3biubiu/loon-youtube-deepl
 #!loon_version = 3.5.1(983)
-#!date = 2026-11-03
-#!tag = YouTube,字幕,翻译
+#!date = 2026-11-04
+#!tag = YouTube,字幕,翻译,Gemini
 
 [Argument]
 enabled = switch,true,tag=启用翻译
-provider = select,"DeepL","DeepLX","DeepLX-Batch",tag=接口类型,desc=DeepL 为官方或兼容接口；旧 DeepLX 逐条请求；新版 DLX 支持 DeepLX-Batch
+provider = select,"DeepL","Gemini","DeepLX","DeepLX-Batch",tag=接口类型,desc=Gemini 使用下面单独配置的 Google API 地址和密钥；DeepL 配置保持兼容
 api_url = input,"https://api-free.deepl.com/v2/translate",tag=翻译接口完整地址,desc=填写完整路径；DeepLX 通常以 /translate 结尾；支持反向代理的自定义路径和查询参数
 api_key = input,"",tag=API Key 或 Token,desc=DeepL 使用 DeepL-Auth-Key；DeepLX 使用 Bearer；无鉴权的自建接口可留空
+gemini_base_url = input,"https://generativelanguage.googleapis.com/v1beta",tag=Gemini API 根路径,desc=使用 Google 原生 generateContent 协议；必须为 HTTPS；不要填写 AI Studio 网页地址
+gemini_model = input,"gemini-3.5-flash-lite",tag=Gemini 模型 ID,desc=默认 ID 已核对 Google 官方文档；如返回 404 请核对模型权限和 API 地址；也可填写其他可用模型 ID
+gemini_api_key = input,"",tag=Gemini API Key,desc=仅在接口类型为 Gemini 时使用；与 DeepL 密钥分开保存
+gemini_batch_chars = input,24000,type=number,tag=Gemini 每批字幕字符数,desc=默认每次合并最多 24000 字符及 800 条字幕；长视频会分成多个大批次；输出截断时适当调小
+gemini_rpd = input,500,type=number,tag=Gemini 本机每日请求上限,desc=按你提供的 500 RPD 默认配置；按太平洋时间换日；0 为暂停；其他设备和应用调用不能自动统计
+gemini_rpm = input,15,type=number,tag=Gemini 每分钟请求上限,desc=按你提供的 15 RPM 默认配置；Gemini 始终串行；会在本次时限内等待可用名额
+gemini_tpm = input,250000,type=number,tag=Gemini 每分钟 token 上限,desc=按你提供的 250K TPM 默认配置；以请求字节数和最大输出作保守估算；不额外调用 countTokens
+gemini_quota_group = input,"default",tag=Gemini 配额组,desc=同一个 Google 项目的密钥请使用相同组名；计数不随 API Key 更换而清零；多设备仍需自行留出额度
+gemini_budget_seconds = select,100,60,90,110,type=number,tag=Gemini 最长等待秒数,desc=给大批译文预留时间；到时返回已完成的部分；不自动重试
 target_lang = input,"ZH",tag=目标语言,desc=例如 ZH 或 ZH-HANS 或 ZH-HANT 或 EN 或 JA
 source_lang = input,"AUTO",tag=原语言,desc=AUTO 为接口自动识别；也可填 EN 或 JA 等语言代码
 display = select,"bilingual","translation",tag=字幕显示,desc=bilingual 原文在上译文在下；translation 仅译文
@@ -19,10 +28,10 @@ cache = switch,true,tag=本地缓存,desc=缓存字幕及译文七天；修改�
 cache_namespace = input,"default",tag=缓存版本,desc=修改此值可绕过已有缓存
 concurrency = select,2,1,3,type=number,tag=并发请求数,desc=自建 DeepLX 易限流时选 1
 max_chars = input,60000,type=number,tag=每次字幕最大翻译字符数,desc=超过上限部分保留原文；按去重后的文本计算
-budget_seconds = select,45,20,30,50,type=number,tag=最长等待秒数,desc=达到时限返回已完成的译文；剩余字幕保留原文
+budget_seconds = select,45,20,30,50,type=number,tag=其他接口最长等待秒数,desc=用于 DeepL 和 DeepLX；Gemini 使用单独的最长等待设置
 
 [Script]
-response if ${url} ~= /^https:\/\/(?:[\w-]+\.)*youtube\.com\/api\/timedtext(?:\?|$)/ && ${response.status} == 200 then script("https://raw.githubusercontent.com/3biubiu/loon-youtube-deepl/main/YouTube-DeepL.js", {${enabled}, ${provider}, ${api_url}, ${api_key}, ${target_lang}, ${source_lang}, ${display}, ${context}, ${cache}, ${cache_namespace}, ${concurrency}, ${max_chars}, ${budget_seconds}}) with enable=${enabled}, requires_body=true, timeout=60, tag="YouTube DeepL 字幕"
+response if ${url} ~= /^https:\/\/(?:[\w-]+\.)*youtube\.com\/api\/timedtext(?:\?|$)/ && ${response.status} == 200 then script("https://raw.githubusercontent.com/3biubiu/loon-youtube-deepl/main/YouTube-DeepL.js", {${enabled}, ${provider}, ${api_url}, ${api_key}, ${gemini_base_url}, ${gemini_model}, ${gemini_api_key}, ${gemini_batch_chars}, ${gemini_rpd}, ${gemini_rpm}, ${gemini_tpm}, ${gemini_quota_group}, ${gemini_budget_seconds}, ${target_lang}, ${source_lang}, ${display}, ${context}, ${cache}, ${cache_namespace}, ${concurrency}, ${max_chars}, ${budget_seconds}}) with enable=${enabled}, requires_body=true, timeout=120, tag="YouTube DeepL / Gemini 字幕"
 
 [Mitm]
 hostname = www.youtube.com, m.youtube.com, youtube.com

@@ -10,6 +10,7 @@ const captions = (texts) => JSON.stringify({wireMagic: 'pb3', events: [{tStartMs
 function run(options = {}) {
   const calls = [], logs = [], timers = [], results = [];
   const storage = options.storage || {};
+  let now = options.now;
   let complete;
   const finished = new Promise(resolve => { complete = resolve; });
   const ctx = {
@@ -17,7 +18,10 @@ function run(options = {}) {
     $request: {url: options.url || baseURL},
     $response: {status: options.status || 200, body: options.body === undefined ? captions(['Hello', 'Good morning']) : options.body},
     $argument: Object.assign({api_url: 'https://translation.example/v2/translate', api_key: 'fake-test-key'}, options.args),
-    $persistentStore: {read: k => storage[k] || null, write: (v, k) => {storage[k] = v; return true;}},
+    $persistentStore: {read: k => storage[k] || null, write: (v, k) => {
+      if (options.failQuotaWrite && k.startsWith('youtube_gemini_quota_v1_')) return false;
+      storage[k] = v; return true;
+    }},
     $httpClient: {post: (req, cb) => {
       calls.push(req);
       if (options.post) return options.post(req, cb, calls.length);
@@ -27,8 +31,12 @@ function run(options = {}) {
     setTimeout: (fn, ms) => {timers.push({fn, ms}); return timers.length;},
     $done: value => {results.push(value); complete(value);}
   };
+  if (now !== undefined) ctx.Date = class extends Date {
+    constructor(...args) { super(...(args.length ? args : [now])); }
+    static now() { return now; }
+  };
   vm.runInNewContext(source, ctx, {timeout: 3000, filename: 'YouTube-DeepL.js'});
-  return {calls, logs, timers, results, storage, finished};
+  return {calls, logs, timers, results, storage, finished, advance: ms => { now += ms; }};
 }
 function parsed(output) { return JSON.parse(output.body); }
 const flush = async () => { for (let n = 0; n < 12; n++) await Promise.resolve(); };
@@ -236,4 +244,242 @@ test('plugin parameter references match declarations and use the published raw s
   for (const key of declarations) assert.ok(bindings.includes(key), key);
   assert.ok(script.includes('script("https://raw.githubusercontent.com/3biubiu/loon-youtube-deepl/main/YouTube-DeepL.js"'));
   assert.ok(plugin.includes('#!loon_version = 3.5.1(983)'));
+});
+
+const geminiArgs = {provider: 'Gemini', gemini_api_key: 'fake-google-key'};
+function geminiReply(req, cb, map = rows => rows) {
+  const data = JSON.parse(req.body);
+  const input = JSON.parse(data.contents[0].parts[0].text);
+  const rows = map(input.segments.map(segment => ({id: segment.id, text: '译:' + segment.text})));
+  cb(null, {status: 200}, JSON.stringify({candidates: [{finishReason: 'STOP', content: {parts: [{text: JSON.stringify({translations: rows})}]}}]}));
+}
+function geminiRun(options = {}) {
+  return run({...options, args: {...geminiArgs, ...options.args}, post: options.post || ((req, cb) => geminiReply(req, cb))});
+}
+function quota(r) {
+  const key = Object.keys(r.storage).find(key => key.startsWith('youtube_gemini_quota_v1_'));
+  return key ? JSON.parse(r.storage[key]) : null;
+}
+
+test('Gemini translates hundreds of cues in one call, using isolated Google credentials and a schema', async () => {
+  const texts = Array.from({length: 600}, (_, n) => 'Line ' + n);
+  const r = geminiRun({body: captions(texts)});
+  const out = parsed(await r.finished);
+  assert.equal(r.calls.length, 1);
+  assert.equal(out.events[600].segs[0].utf8, 'Line 599\n译:Line 599');
+  const req = r.calls[0], p = JSON.parse(req.body);
+  assert.equal(req.url, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent');
+  assert.equal(req.headers['x-goog-api-key'], 'fake-google-key');
+  assert.equal('Authorization' in req.headers, false);
+  assert.ok(!req.url.includes('fake-google-key'));
+  assert.ok(!req.body.includes('fake-test-key'));
+  assert.equal(p.generationConfig.responseMimeType, 'application/json');
+  assert.equal(p.generationConfig.responseSchema.type, 'OBJECT');
+  assert.equal(p.generationConfig.maxOutputTokens, 32768);
+  assert.ok(p.systemInstruction.parts[0].text.includes('untrusted'));
+  assert.equal(quota(r).used, 1);
+});
+test('Gemini accepts a custom native API base and configurable model ID', async () => {
+  const r = geminiRun({args: {gemini_base_url: 'https://proxy.example/google/v1beta/', gemini_model: 'models/custom-flash-lite'}});
+  await r.finished;
+  assert.equal(r.calls[0].url, 'https://proxy.example/google/v1beta/models/custom-flash-lite:generateContent');
+});
+test('Gemini maps reordered ID rows back onto the correct original timings', async () => {
+  const r = geminiRun({post: (req, cb) => geminiReply(req, cb, rows => rows.reverse())});
+  const out = parsed(await r.finished);
+  assert.equal(out.events[1].segs[0].utf8, 'Hello\n译:Hello');
+  assert.equal(out.events[2].segs[0].utf8, 'Good morning\n译:Good morning');
+  assert.equal(out.events[2].tStartMs, 1200);
+});
+test('Gemini removes duplicate cues before building the large batch', async () => {
+  const r = geminiRun({body: captions(['same', 'same', 'different', '\n'])});
+  await r.finished;
+  const input = JSON.parse(JSON.parse(r.calls[0].body).contents[0].parts[0].text);
+  assert.equal(input.segments.length, 2);
+});
+test('Gemini batches honor both configurable character limits and an 800-cue output bound', async () => {
+  const limited = geminiRun({body: captions(Array.from({length: 10}, (_, n) => n + 'x'.repeat(499))), args: {gemini_batch_chars: 1000}});
+  await limited.finished; assert.equal(limited.calls.length, 5);
+  const many = geminiRun({body: captions(Array.from({length: 1001}, (_, n) => 'x' + n))});
+  await many.finished; assert.equal(many.calls.length, 2);
+  for (const req of many.calls) {
+    const segments = JSON.parse(JSON.parse(req.body).contents[0].parts[0].text).segments;
+    assert.ok(segments.length <= 800);
+  }
+});
+test('Gemini stays serial even when the legacy concurrency option is 3', async () => {
+  const callbacks = [];
+  const r = geminiRun({body: captions(['a'.repeat(700), 'b'.repeat(700), 'c'.repeat(700)]), args: {concurrency: 3, gemini_batch_chars: 1000}, post: (req, cb) => callbacks.push(() => geminiReply(req, cb))});
+  await flush(); assert.equal(r.calls.length, 1);
+  callbacks.shift()(); await flush(); assert.equal(r.calls.length, 2);
+  callbacks.shift()(); await flush(); assert.equal(r.calls.length, 3);
+  callbacks.shift()(); await r.finished;
+  assert.equal(quota(r).used, 3);
+});
+test('Gemini cache hits spend neither daily nor minute quota', async () => {
+  const storage = {};
+  const first = geminiRun({storage, args: {gemini_rpd: 1}}); await first.finished;
+  const second = geminiRun({storage, args: {gemini_rpd: 1}});
+  assert.ok((await second.finished).body);
+  assert.equal(second.calls.length, 0); assert.equal(quota(second).used, 1);
+});
+test('Gemini translation cache isolates model IDs', async () => {
+  const storage = {};
+  const first = geminiRun({storage}); await first.finished;
+  const second = geminiRun({storage, args: {gemini_model: 'other-model'}}); await second.finished;
+  assert.equal(second.calls.length, 1);
+});
+test('local RPD blocks subsequent requests but does not remove completed translations', async () => {
+  const r = geminiRun({body: captions(['a'.repeat(700), 'b'.repeat(700)]), args: {gemini_rpd: 1, gemini_batch_chars: 1000}});
+  const out = parsed(await r.finished);
+  assert.equal(r.calls.length, 1); assert.equal(quota(r).used, 1);
+  assert.equal(out.events[1].segs[0].utf8, 'a'.repeat(700) + '\n译:' + 'a'.repeat(700));
+  assert.equal(out.events[2].segs[0].utf8, 'b'.repeat(700));
+});
+test('RPD zero explicitly pauses Gemini API use', async () => {
+  const r = geminiRun({args: {gemini_rpd: 0}});
+  assert.equal((await r.finished).body, undefined); assert.equal(r.calls.length, 0);
+});
+test('changing Google keys or translation target does not reset the shared local project quota', async () => {
+  const storage = {};
+  const first = geminiRun({storage, args: {cache: false, gemini_rpd: 1}}); await first.finished;
+  for (const args of [{gemini_api_key: 'other-google-key'}, {target_lang: 'JA'}]) {
+    const next = geminiRun({storage, args: {...args, cache: false, gemini_rpd: 1}});
+    await next.finished; assert.equal(next.calls.length, 0);
+  }
+});
+test('separate quota groups can represent genuinely separate projects', async () => {
+  const storage = {};
+  const first = geminiRun({storage, args: {cache: false, gemini_rpd: 1}}); await first.finished;
+  const second = geminiRun({storage, args: {cache: false, gemini_rpd: 1, gemini_quota_group: 'another-project'}});
+  await second.finished; assert.equal(second.calls.length, 1);
+});
+for (const boundary of [
+  '2026-11-04T07:59:50Z', // winter midnight at 08:00 UTC
+  '2026-07-04T06:59:50Z', // summer midnight at 07:00 UTC
+  '2026-03-08T07:59:50Z', // day of spring transition: midnight is still standard time
+  '2026-03-09T06:59:50Z', // midnight after spring transition
+  '2026-11-01T06:59:50Z', // day of fall transition: midnight is still daylight time
+  '2026-11-02T07:59:50Z'  // midnight after fall transition
+]) test('Pacific daily quota rolls over correctly at ' + boundary, async () => {
+  const storage = {}, now = Date.parse(boundary);
+  const first = geminiRun({storage, now, args: {cache: false, gemini_rpd: 1}}); await first.finished;
+  const previous = quota(first).day;
+  const second = geminiRun({storage, now: now + 20000, args: {cache: false, gemini_rpd: 1}});
+  await second.finished; assert.equal(second.calls.length, 1);
+  assert.notEqual(quota(second).day, previous); assert.equal(quota(second).used, 1);
+});
+test('China or UTC midnight does not reset the Pacific daily quota', async () => {
+  const storage = {}, now = Date.parse('2026-11-04T23:59:50Z');
+  const first = geminiRun({storage, now, args: {cache: false, gemini_rpd: 1}}); await first.finished;
+  const second = geminiRun({storage, now: now + 20000, args: {cache: false, gemini_rpd: 1}});
+  await second.finished; assert.equal(second.calls.length, 0);
+});
+test('rolling RPM is shared across invocations and reserves no call until the wait completes', async () => {
+  const storage = {}, now = Date.parse('2026-11-04T12:00:00Z'), args = {cache: false, gemini_rpm: 1};
+  const first = geminiRun({storage, now, args}); await first.finished;
+  const second = geminiRun({storage, now, args});
+  await flush(); assert.equal(second.calls.length, 0); assert.equal(quota(second).used, 1);
+  assert.equal(second.timers[1].ms, 60050);
+  second.advance(60050); second.timers[1].fn();
+  await second.finished; assert.equal(second.calls.length, 1); assert.equal(quota(second).used, 2);
+});
+test('conservative TPM reservation also waits without adding a countTokens API call', async () => {
+  const storage = {}, now = Date.parse('2026-11-04T12:00:00Z'), args = {cache: false, gemini_tpm: 50000};
+  const first = geminiRun({storage, now, args}); await first.finished;
+  assert.ok(quota(first).recent[0].tokens > 32768);
+  const second = geminiRun({storage, now, args});
+  await flush(); assert.equal(second.calls.length, 0);
+  second.advance(60050); second.timers[1].fn();
+  await second.finished; assert.equal(second.calls.length, 1);
+  assert.ok(second.calls[0].url.endsWith(':generateContent'));
+});
+test('TPM below the single-request budget prevents POST rather than silently overspending', async () => {
+  const r = geminiRun({args: {gemini_tpm: 1000}});
+  await r.finished; assert.equal(r.calls.length, 0);
+});
+test('minute wait beyond the script deadline returns original subtitles immediately', async () => {
+  const storage = {}, now = Date.parse('2026-11-04T12:00:00Z');
+  const first = geminiRun({storage, now, args: {cache: false, gemini_rpm: 1}}); await first.finished;
+  const second = geminiRun({storage, now, args: {cache: false, gemini_rpm: 1, gemini_budget_seconds: 10}});
+  assert.equal((await second.finished).body, undefined); assert.equal(second.calls.length, 0);
+});
+test('daily-quota 429 persists a block for the Pacific day and never retries', async () => {
+  const storage = {}, now = Date.parse('2026-11-04T12:00:00Z');
+  const first = geminiRun({storage, now, args: {cache: false}, post: (req, cb) => cb(null, {status: 429}, JSON.stringify({error: {details: [
+    {'@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}]},
+    {'@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '120s'}
+  ]}}))});
+  await first.finished; assert.equal(first.calls.length, 1); assert.equal(quota(first).used, 1);
+  assert.equal(quota(first).blockedDay, quota(first).day);
+  assert.equal(quota(first).blockedUntil, now + 120000);
+  const second = geminiRun({storage, now: now + 180000, args: {cache: false}});
+  await second.finished; assert.equal(second.calls.length, 0);
+});
+test('minute 429 preserves RetryInfo cooldown across invocations without same-call retries', async () => {
+  const storage = {}, now = Date.parse('2026-11-04T12:00:00Z');
+  const first = geminiRun({storage, now, args: {cache: false}, post: (req, cb) => cb(null, {status: 429}, JSON.stringify({error: {details: [
+    {'@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '120s'}
+  ]}}))});
+  await first.finished; assert.equal(first.calls.length, 1);
+  assert.equal(quota(first).blockedDay, undefined);
+  const second = geminiRun({storage, now, args: {cache: false}});
+  await second.finished; assert.equal(second.calls.length, 0);
+});
+for (const [name, transform] of Object.entries({
+  'missing ID': rows => [rows[0]],
+  'duplicate ID': rows => [rows[0], rows[0]],
+  'out of range ID': rows => [{...rows[0], id: 99}, rows[1]],
+  'string ID': rows => [{...rows[0], id: '0'}, rows[1]],
+  'empty text': rows => [{...rows[0], text: ''}, rows[1]],
+  'invalid XML text': rows => [{...rows[0], text: '\u0001'}, rows[1]]
+})) test('Gemini ' + name + ' fails open without spending a repair request', async () => {
+  const r = geminiRun({post: (req, cb) => geminiReply(req, cb, transform)});
+  assert.equal((await r.finished).body, undefined); assert.equal(r.calls.length, 1); assert.equal(quota(r).used, 1);
+});
+for (const reason of ['MAX_TOKENS', 'SAFETY', 'RECITATION']) test('Gemini finishReason ' + reason + ' does not apply partial JSON or retry', async () => {
+  const r = geminiRun({post: (req, cb) => cb(null, {status: 200}, JSON.stringify({candidates: [{finishReason: reason, content: {parts: [{text: '{partial'}]}}]}))});
+  assert.equal((await r.finished).body, undefined); assert.equal(r.calls.length, 1);
+});
+test('Gemini does not interpret a thought part as translation JSON', async () => {
+  const r = geminiRun({post: (req, cb) => cb(null, {status: 200}, JSON.stringify({candidates: [{finishReason: 'STOP', content: {parts: [
+    {thought: true, text: 'internal reasoning must be ignored'},
+    {text: JSON.stringify({translations: [{id: 0, text: '你好'}, {id: 1, text: '早上好'}]})}
+  ]}}]}))});
+  assert.equal(parsed(await r.finished).events[1].segs[0].utf8, 'Hello\n你好');
+});
+test('Gemini request timeout retains the reserved count and ignores late callback', async () => {
+  let late;
+  const r = geminiRun({post: (req, cb) => { late = () => geminiReply(req, cb); }});
+  await flush(); assert.equal(r.calls.length, 1); assert.equal(quota(r).used, 1);
+  r.timers[1].fn(); await r.finished;
+  late(); r.timers[0].fn(); await flush();
+  assert.equal(r.results.length, 1); assert.equal(quota(r).used, 1); assert.equal(r.results[0].body, undefined);
+});
+test('Gemini quota storage failure prevents a request', async () => {
+  const r = geminiRun({failQuotaWrite: true});
+  await r.finished; assert.equal(r.calls.length, 0);
+});
+test('Gemini rejects corrupted persisted counters instead of resetting and overspending', async () => {
+  const storage = {};
+  const first = geminiRun({storage, args: {cache: false}}); await first.finished;
+  const key = Object.keys(storage).find(key => key.startsWith('youtube_gemini_quota_v1_'));
+  storage[key] = '{broken';
+  const second = geminiRun({storage, args: {cache: false}}); await second.finished;
+  assert.equal(second.calls.length, 0); assert.equal(storage[key], '{broken');
+});
+for (const [name, args] of Object.entries({
+  'missing Google key': {gemini_api_key: ''},
+  'injected Google key': {gemini_api_key: 'key\r\nInjected: secret'},
+  'AI Studio webpage as API URL': {gemini_base_url: 'https://aistudio.google.com/usage?timeRange=last-28-days'},
+  'insecure Google endpoint': {gemini_base_url: 'http://proxy.example/v1beta'},
+  'path injection model': {gemini_model: '../other/model'}
+})) test('Gemini ' + name + ' is rejected without an API request', async () => {
+  const r = geminiRun({args}); await r.finished; assert.equal(r.calls.length, 0);
+});
+test('Gemini keys and model responses do not enter logs or quota records', async () => {
+  const r = geminiRun({post: (req, cb) => cb(null, {status: 403}, '{"error":{"message":"sensitive model response"}}')});
+  await r.finished;
+  assert.ok(!r.logs.join('\n').match(/sensitive|fake-google-key|fake-test-key/));
+  assert.ok(!JSON.stringify(r.storage).includes('fake-google-key'));
 });
