@@ -1,0 +1,12 @@
+{
+  "name": "loon-youtube-deepl",
+  "version": "1.1.1",
+  "private": true,
+  "description": "Loon YouTube subtitles with DeepL or large-batch Gemini translation and local quota guards",
+  "scripts": {
+    "test": "node --test tests/youtube-deepl.test.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
